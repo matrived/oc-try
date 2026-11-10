@@ -1,16 +1,16 @@
----
 name: ocr-reader
-description: "Read text from images (receipts, screenshots, documents) via the local llama-server multimodal endpoint."
+description: "Read text from images (receipts, screenshots, documents) using the FW-Muse-Glimmer-30B vision model on the Azure APIM endpoint."
 metadata:
   openclaw:
     emoji: "🔍"
     requires:
-      bins: ["base64", "curl"]
+      bins: ["curl", "python3"]
 ---
 
 # OCR Reader
 
-Extract text from images using the local `llama-server` with vision support.
+Extract text from images by sending them to `FW-Muse-Glimmer-30B` on the Azure APIM
+gateway (OpenAI-compatible chat completions API with image input).
 
 ## When to use
 
@@ -20,37 +20,56 @@ Extract text from images using the local `llama-server` with vision support.
 
 ## Workflow
 
-1. **Get the image path** — check workspace first, ask user to upload if not found
-2. **Convert to base64:** `base64 -w 0 /path/to/image.jpg`
-3. **Send to llama-server** with the prompt and image in one curl call:
+1. **Find the image**: check the path the user gave, then the workspace. If not found, ask the user to upload it.
+2. **Run this single command**, with IMG and PROMPT set for the task:
 
 ```bash
 IMG="/workspace/sample-receipt-photo.jpg"
-PROMPT="What text is on this image? Transcribe everything you see."
-B64=$(base64 -w 0 "$IMG")
-curl -s -X POST http://localhost:8080/v1/chat/completions \
+PROMPT="What text is on this image? Transcribe everything you see exactly as it appears."
+MODEL="FW-Muse-Glimmer-30B"
+REQ=$(mktemp)
+python3 - "$IMG" "$PROMPT" "$MODEL" > "$REQ" <<'EOF'
+import base64, json, mimetypes, sys
+img, prompt, model = sys.argv[1:4]
+mime = mimetypes.guess_type(img)[0] or "image/jpeg"
+b64 = base64.b64encode(open(img, "rb").read()).decode()
+print(json.dumps({"model": model, "max_tokens": 4096, "stream": False,
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": prompt},
+    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]}]}))
+EOF
+curl -sS -m 300 "${OPENAI_BASE_URL%/}/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ***" \
-  -d "{
-    \"model\": \"/models/unsloth-Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K.gguf\",
-    \"messages\": [{\"role\":\"user\",\"content\":[
-      {\"type\":\"text\",\"text\":\"$PROMPT\"},
-      {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$B64\"}}
-    ]}],
-    \"max_tokens\": 4096,
-    \"stream\": false
-  }" | node -e "process.stdin.on('data',d=>console.log(JSON.parse(d).choices[0].message.content))"
+  -H "api-key: $OPENAI_API_KEY" \
+  --data-binary @"$REQ" \
+| python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"] if "choices" in d else d)'
+rm -f "$REQ"
 ```
+
+3. **Return the transcription** to the user as-is. Only summarise or reformat if the user asked for that.
 
 ## Key rules
 
-- The `image_url` MUST use `data:image/jpeg;base64,...` format — this is what triggers the vision encoder
-- Text and image go in separate `type` blocks inside the `content` array
-- Default prompt: `"What text is on this image? Transcribe everything you see exactly as it appears."`
-- Use specific prompts for extraction: `"List all line items with prices"` or `"Extract just the total amount"`
-- Warn user before running — CPU inference on this model takes ~2-5 minutes
+- Auth is the `api-key` header. Never use `Authorization: Bearer`; APIM rejects it with 401.
+- Never print, echo, or write `$OPENAI_API_KEY` anywhere.
+- The image is sent as a `data:<mime>;base64,...` URL in its own `image_url` block; the instruction goes in a separate `text` block.
+- The JSON body goes through a temp file (`--data-binary @file`), because large images exceed the shell's argument length limit.
+- Use specific prompts for extraction tasks:
+  - `"List all line items with their prices"`
+  - `"Extract just the total amount"`
+  - `"Return the text as a markdown table"`
+- A response usually takes 3–15 seconds (remote API).
+
+## Troubleshooting
+
+| Output | Meaning |
+|---|---|
+| `statusCode 401` / "missing subscription key" | `OPENAI_API_KEY` is empty in the gateway's environment |
+| `DeploymentNotFound` | Model name is wrong; it must be exactly `FW-Muse-Glimmer-30B` |
+| `No such file or directory` | Wrong image path |
+| Very small or blurry image gives vague output | Ask the user for a larger or clearer image |
 
 ## Prerequisites
 
-- `llama-server` running on `localhost:8080` with `--mmproj` loaded
-- Verify: `curl -s http://localhost:8080/v1/models | grep multimodal`
+- `OPENAI_BASE_URL` and `OPENAI_API_KEY` exported in the environment the gateway was started from
+- Verify: `echo ${#OPENAI_API_KEY}` prints `32`
